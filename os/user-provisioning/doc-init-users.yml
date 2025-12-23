@@ -1,0 +1,136 @@
+schemaVersion: "2.2"
+description: "Create OS users, deploy SSH keys from S3, grant sudo, and disable password auth"
+parameters:
+  SshKeyBucket:
+    type: String
+    description: "S3 bucket name where SSH public keys are stored"
+  SshKeyPrefix:
+    type: String
+    description: "S3 key prefix (e.g. env/prod)"
+    default: ""
+  UserNames:
+    type: String
+    description: "OS user names to create (comma-separated, e.g. sysuser,appuser)"
+  SudoUsers:
+    type: String
+    description: "Users to grant passwordless sudo (comma-separated, e.g. sysuser,appuser). Empty to skip."
+    default: ""
+  DisablePasswordAuth:
+    type: String
+    description: "Disable SSH password authentication (yes/no)"
+    default: "yes"
+mainSteps:
+  - action: aws:runShellScript
+    name: initUsers
+    inputs:
+      runCommand:
+        - |
+          set -euo pipefail
+
+          BUCKET="{{ SshKeyBucket }}"
+          PREFIX="{{ SshKeyPrefix }}"
+          DISABLE_PW="{{ DisablePasswordAuth }}"
+          USER_CSV="{{ UserNames }}"
+          SUDO_CSV="{{ SudoUsers }}"
+
+          IFS=',' read -r -a USERS <<< "${USER_CSV}"
+          if [ -n "${SUDO_CSV}" ]; then
+            IFS=',' read -r -a SUDO_USERS <<< "${SUDO_CSV}"
+          else
+            SUDO_USERS=()
+          fi
+
+          echo "[INFO] Users to create: ${USERS[*]}"
+          echo "[INFO] Sudo users: ${SUDO_USERS[*]}"
+          echo "[INFO] S3 bucket: ${BUCKET}"
+          echo "[INFO] S3 prefix: ${PREFIX}"
+
+          if ! command -v aws >/dev/null 2>&1; then
+            echo "[ERROR] aws CLI not found. Install awscli before running this document." >&2
+            exit 1
+          fi
+
+          create_user_and_key() {
+            local user="$1"
+
+            if ! id "${user}" >/dev/null 2>&1; then
+              echo "[INFO] Creating user: ${user}"
+              useradd -m -s /bin/bash "${user}"
+            else
+              echo "[INFO] User already exists: ${user}"
+            fi
+
+            local home
+            home=$(eval echo "~${user}")
+
+            mkdir -p "${home}/.ssh"
+            chmod 700 "${home}/.ssh"
+
+            local key_path
+            if [ -n "${PREFIX}" ]; then
+              key_path="s3://${BUCKET}/${PREFIX}/${user}.pub"
+            else
+              key_path="s3://${BUCKET}/${user}.pub"
+            fi
+
+            echo "[INFO] Downloading key for ${user} from ${key_path}"
+            aws s3 cp "${key_path}" "${home}/.ssh/authorized_keys"
+
+            chmod 600 "${home}/.ssh/authorized_keys"
+            chown -R "${user}:${user}" "${home}/.ssh"
+          }
+
+          grant_sudo() {
+            local user="$1"
+            local file="/etc/sudoers.d/${user}"
+
+            echo "[INFO] Granting passwordless sudo to ${user}"
+            echo "${user} ALL=(ALL) NOPASSWD:ALL" > "${file}"
+            chmod 440 "${file}"
+          }
+
+          disable_password_auth() {
+            echo "[INFO] Disabling SSH password authentication"
+
+            local conf="/etc/ssh/sshd_config"
+            local backup="/etc/ssh/sshd_config.bak_$(date +%Y%m%d%H%M%S)"
+
+            cp "${conf}" "${backup}"
+
+            if grep -qE '^[# ]*PasswordAuthentication' "${conf}"; then
+              sed -i 's/^[# ]*PasswordAuthentication.*/PasswordAuthentication no/' "${conf}"
+            else
+              echo "PasswordAuthentication no" >> "${conf}"
+            fi
+
+            if grep -qE '^[# ]*ChallengeResponseAuthentication' "${conf}"; then
+              sed -i 's/^[# ]*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' "${conf}"
+            else
+              echo "ChallengeResponseAuthentication no" >> "${conf}"
+            fi
+
+            if command -v systemctl >/dev/null 2>&1; then
+              systemctl reload sshd || systemctl restart sshd
+            else
+              service sshd reload || service sshd restart
+            fi
+          }
+
+          for u in "${USERS[@]}"; do
+            # 空要素対策（"sysuser,appuser," みたいな入力）
+            [ -z "${u}" ] && continue
+            create_user_and_key "${u}"
+          done
+
+          for su in "${SUDO_USERS[@]}"; do
+            [ -z "${su}" ] && continue
+            grant_sudo "${su}"
+          done
+
+          if [ "${DISABLE_PW}" = "yes" ]; then
+            disable_password_auth
+          else
+            echo "[INFO] DisablePasswordAuth is 'no'; skip sshd_config update"
+          fi
+
+          echo "[INFO] All tasks completed successfully."
